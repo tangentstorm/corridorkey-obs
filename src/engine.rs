@@ -61,6 +61,8 @@ pub struct Engine {
     error: Arc<Mutex<Option<String>>>,
     /// Rolling inference time in microseconds, for the properties readout.
     last_us: Arc<AtomicU64>,
+    /// Breakdown of the most recent inference, for the properties readout.
+    last_timings: Arc<Mutex<Option<Timings>>>,
     /// Resolution of the loaded graph, published once the worker is ready. Zero
     /// until then, so the render thread knows not to size anything off it yet.
     infer_size: Arc<AtomicU32>,
@@ -90,6 +92,7 @@ impl Engine {
         let status = Arc::new(AtomicU32::new(ST_LOADING));
         let error = Arc::new(Mutex::new(None));
         let last_us = Arc::new(AtomicU64::new(0));
+        let last_timings = Arc::new(Mutex::new(None));
         let infer_size = Arc::new(AtomicU32::new(0));
         let busy = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -100,6 +103,7 @@ impl Engine {
             let status = Arc::clone(&status);
             let error = Arc::clone(&error);
             let last_us = Arc::clone(&last_us);
+            let last_timings = Arc::clone(&last_timings);
             let infer_size = Arc::clone(&infer_size);
             let busy = Arc::clone(&busy);
             let shutdown = Arc::clone(&shutdown);
@@ -107,7 +111,8 @@ impl Engine {
                 .name("corridorkey-infer".into())
                 .spawn(move || {
                     worker_main(
-                        &path, device_id, rx, latest, status, error, last_us, infer_size, busy,
+                        &path, device_id, rx, latest, status, error, last_us, last_timings,
+                        infer_size, busy,
                         shutdown,
                     );
                 })
@@ -120,6 +125,7 @@ impl Engine {
             status,
             error,
             last_us,
+            last_timings,
             infer_size,
             busy,
             shutdown,
@@ -172,6 +178,11 @@ impl Engine {
         }
     }
 
+    /// Breakdown of the most recent inference, if one has completed.
+    pub fn last_timings(&self) -> Option<Timings> {
+        *self.last_timings.lock()
+    }
+
     pub fn last_inference_ms(&self) -> f32 {
         self.last_us.load(Ordering::Relaxed) as f32 / 1000.0
     }
@@ -197,6 +208,7 @@ fn worker_main(
     status: Arc<AtomicU32>,
     error: Arc<Mutex<Option<String>>>,
     last_us: Arc<AtomicU64>,
+    last_timings: Arc<Mutex<Option<Timings>>>,
     infer_size: Arc<AtomicU32>,
     busy: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -231,8 +243,9 @@ fn worker_main(
         let started = std::time::Instant::now();
 
         match key_bgra(&mut session, &job.bgra, job.stride, &job.params, &mut scratch) {
-            Ok(result) => {
+            Ok((result, t)) => {
                 last_us.store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                last_timings.lock().replace(t);
                 *latest.lock() = Some(Arc::new(result));
             }
             Err(e) => {
@@ -263,17 +276,44 @@ impl Scratch {
 
 /// Hint + inference for one staged BGRA frame. Public so `examples/key_image.rs`
 /// can exercise the identical path offline, without OBS.
+/// Where the time went in one call, in microseconds.
+///
+/// Worth keeping rather than guessing: the split between CPU-side conversion and
+/// the network itself decides whether it is worth moving tensors onto the GPU.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Timings {
+    /// BGRA -> planar float, plus the chroma hint.
+    pub preprocess_us: u64,
+    /// Tensor construction and `Session::run`, which includes ORT's own host
+    /// copies in and out.
+    pub infer_us: u64,
+    /// Planar float outputs -> interleaved RGBA8 for upload.
+    pub pack_us: u64,
+}
+
+impl Timings {
+    pub fn total_us(&self) -> u64 {
+        self.preprocess_us + self.infer_us + self.pack_us
+    }
+}
+
 pub fn key_bgra(
     session: &mut ort::session::Session,
     bgra: &[u8],
     stride: usize,
     params: &HintParams,
     scratch: &mut Scratch,
-) -> Result<KeyResult, String> {
+) -> Result<(KeyResult, Timings), String> {
     let size = scratch.size;
+    let mut t = Timings::default();
+
+    let start = std::time::Instant::now();
     bgra_to_chw(bgra, size, size, stride, &mut scratch.rgb);
     chroma_hint(bgra, size, size, stride, params, &mut scratch.hint);
-    run(session, size, &scratch.rgb, &scratch.hint)
+    t.preprocess_us = start.elapsed().as_micros() as u64;
+
+    let result = run(session, size, &scratch.rgb, &scratch.hint, &mut t)?;
+    Ok((result, t))
 }
 
 /// `device_id` is a DXGI adapter index for DirectML (or a CUDA device ordinal);
@@ -385,9 +425,11 @@ fn run(
     size: usize,
     rgb: &[f32],
     hint: &[f32],
+    t: &mut Timings,
 ) -> Result<KeyResult, String> {
     let pixels = size * size;
     use ort::value::Tensor;
+    let infer_start = std::time::Instant::now();
 
     let rgb_t = Tensor::from_array(([1usize, 3, size, size], rgb.to_vec()))
         .map_err(|e| e.to_string())?;
@@ -415,7 +457,10 @@ fn run(
         ));
     }
 
+    t.infer_us = infer_start.elapsed().as_micros() as u64;
+
     // Pack planar float -> interleaved RGBA8 for a single texture upload.
+    let pack_start = std::time::Instant::now();
     let mut rgba = vec![0u8; pixels * 4];
     for i in 0..pixels {
         rgba[i * 4] = to_u8(fg[i]);
@@ -423,6 +468,7 @@ fn run(
         rgba[i * 4 + 2] = to_u8(fg[2 * pixels + i]);
         rgba[i * 4 + 3] = to_u8(alpha[i]);
     }
+    t.pack_us = pack_start.elapsed().as_micros() as u64;
     Ok(KeyResult { rgba })
 }
 

@@ -128,9 +128,16 @@ pub struct Filter {
     small: *mut gs_texrender_t,
     /// Staged on one frame, mapped on the next. Mapping a surface in the same
     /// frame it was staged forces a CPU/GPU sync.
-    stage: *mut gs_stagesurf_t,
-    stage_pending: bool,
-    /// Resolution `stage` and `key_tex` were created at.
+    /// Two staging surfaces, written and read a frame apart. A surface staged
+    /// this frame cannot be mapped this frame without forcing a CPU/GPU sync, so
+    /// one is always being written while the other is being read.
+    stage: [*mut gs_stagesurf_t; 2],
+    /// Slot the next capture writes to; the other slot holds the previous frame.
+    stage_idx: usize,
+    /// False until the first capture has been staged, so nothing maps a surface
+    /// that has never been written.
+    stage_primed: bool,
+    /// Resolution the staging surfaces and `key_tex` were created at.
     buffer_size: usize,
 
     key_tex: *mut gs_texture_t,
@@ -195,19 +202,24 @@ impl Filter {
             return;
         }
         obs_enter_graphics();
-        if !self.stage.is_null() {
-            gs_stagesurface_destroy(self.stage);
+        for slot in self.stage.iter() {
+            if !slot.is_null() {
+                gs_stagesurface_destroy(*slot);
+            }
         }
         if !self.key_tex.is_null() {
             gs_texture_destroy(self.key_tex);
         }
-        self.stage = gs_stagesurface_create(size as u32, size as u32, GS_BGRA);
+        for slot in self.stage.iter_mut() {
+            *slot = gs_stagesurface_create(size as u32, size as u32, GS_BGRA);
+        }
         self.key_tex =
             gs_texture_create(size as u32, size as u32, GS_RGBA, 1, ptr::null(), GS_DYNAMIC);
         obs_leave_graphics();
 
-        // Anything staged against the old surface is gone.
-        self.stage_pending = false;
+        // Anything staged against the old surfaces is gone.
+        self.stage_primed = false;
+        self.stage_idx = 0;
         self.readback.clear();
         self.buffer_size = size;
     }
@@ -252,8 +264,10 @@ impl Filter {
         if !self.small.is_null() {
             gs_texrender_destroy(self.small);
         }
-        if !self.stage.is_null() {
-            gs_stagesurface_destroy(self.stage);
+        for slot in self.stage.iter() {
+            if !slot.is_null() {
+                gs_stagesurface_destroy(*slot);
+            }
         }
         if !self.key_tex.is_null() {
             gs_texture_destroy(self.key_tex);
@@ -367,20 +381,29 @@ impl Filter {
 
         let small_tex = gs_texrender_get_texture(self.small);
         if !small_tex.is_null() {
-            gs_stage_texture(self.stage, small_tex);
-            self.stage_pending = true;
+            gs_stage_texture(self.stage[self.stage_idx], small_tex);
+            self.stage_idx = 1 - self.stage_idx;
+            self.stage_primed = true;
         }
     }
 
     /// Map the surface staged on an earlier frame and hand the pixels to the
     /// worker. Never maps a surface staged this same frame — that forces a
     /// CPU/GPU sync and stalls the render thread.
-    unsafe fn drain_staged_frame(&mut self) {
-        self.stage_pending = false;
+    unsafe fn drain_staged_frame(&mut self, slot: usize) {
+        // Nothing to hand over: skip the readback entirely rather than map a
+        // surface whose pixels would only be dropped.
+        if !self.engine.as_ref().is_some_and(|e| e.accepting()) {
+            return;
+        }
 
+        let surface = self.stage[slot];
+        if surface.is_null() {
+            return;
+        }
         let mut data: *mut u8 = ptr::null_mut();
         let mut linesize: u32 = 0;
-        if !gs_stagesurface_map(self.stage, &mut data, &mut linesize) {
+        if !gs_stagesurface_map(surface, &mut data, &mut linesize) {
             return;
         }
         // Cleared unconditionally: otherwise a frame whose map yields an unusable
@@ -391,7 +414,7 @@ impl Filter {
             self.readback
                 .extend_from_slice(std::slice::from_raw_parts(data, len));
         }
-        gs_stagesurface_unmap(self.stage);
+        gs_stagesurface_unmap(surface);
 
         if self.readback.is_empty() {
             return;
@@ -445,18 +468,24 @@ impl Filter {
             return;
         }
 
-        // Feed the model at the rate it can actually consume. Inference takes far
-        // longer than one frame, so capturing and reading back every frame would
-        // burn GPU time producing pixels that get dropped. On the frames in
-        // between, this costs nothing.
-        if self.stage_pending {
-            self.drain_staged_frame();
-        } else if self.engine.as_ref().is_some_and(|e| e.accepting()) {
-            // Note this consumes a full begin/end cycle of its own; the visible
-            // pass below starts a second one. Rendering the input twice on these
-            // frames is far cheaper than the inference it feeds.
-            self.run_analysis_pass(width, height);
+        // Read back the frame staged last time and, if the worker is free, hand it
+        // over; then immediately stage a fresh one into the other surface.
+        //
+        // Both halves run every frame, on purpose. Gating the capture on the
+        // worker being idle, and doing the two halves on alternate frames, cost
+        // two extra frames of staleness each cycle: the worker would finish, then
+        // wait a frame for a capture and another for the readback, so a 20ms
+        // inference turned into a ~66ms cycle and a matte 3-6 frames behind the
+        // picture. That lag is what leaves an outline trailing a moving arm.
+        //
+        // Capturing unconditionally means roughly half the captures are thrown
+        // away, but a 256x256 downscale and readback is a fraction of a
+        // millisecond, and it means the instant the worker frees up there is a
+        // frame at most one frame old waiting for it.
+        if self.stage_primed {
+            self.drain_staged_frame(1 - self.stage_idx);
         }
+        self.run_analysis_pass(width, height);
 
         // Upload the newest finished matte.
         if let Some(result) = self.engine.as_ref().and_then(|e| e.latest()) {
@@ -524,8 +553,9 @@ unsafe extern "C" fn create(settings: *mut obs_data_t, source: *mut obs_source_t
             effect: ptr::null_mut(),
             params: None,
             small: ptr::null_mut(),
-            stage: ptr::null_mut(),
-            stage_pending: false,
+            stage: [ptr::null_mut(); 2],
+            stage_idx: 0,
+            stage_primed: false,
             buffer_size: 0,
             key_tex: ptr::null_mut(),
             readback: Vec::new(),
@@ -704,10 +734,15 @@ unsafe extern "C" fn get_properties(data: *mut c_void) -> *mut obs_properties_t 
             let filter = &*(data as *const Filter);
             let text = match filter.engine.as_ref().map(|e| (e.status(), e)) {
                 Some((Status::Ready, e)) => {
-                    let ms = e.last_inference_ms();
                     let size = e.infer_size().unwrap_or(0);
+                    let t = e.last_timings().unwrap_or_default();
+                    // The breakdown is here because it answers the question that
+                    // actually comes up: is the network slow, or is the plumbing?
                     format!(
-                        "Running at {size}x{size}. Inference: {ms:.0} ms/frame                          (matte lags the picture by about that much)"
+                        "Running at {size}x{size}, {:.0} ms/frame                          (network {:.0} ms, conversion {:.1} ms).                          The matte lags the picture by roughly this much plus a frame.",
+                        t.total_us() as f32 / 1000.0,
+                        t.infer_us as f32 / 1000.0,
+                        (t.preprocess_us + t.pack_us) as f32 / 1000.0,
                     )
                 }
                 Some((Status::Loading, _)) => "Loading model...".to_string(),

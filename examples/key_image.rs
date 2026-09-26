@@ -63,10 +63,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Time a few runs; the first includes lazy kernel setup in the EP.
     let mut result = None;
-    for i in 0..3 {
+    for i in 0..4 {
         let t = std::time::Instant::now();
-        result = Some(key_bgra(&mut session, &bgra, stride, &hint_params, &mut scratch)?);
-        println!("run {i}: {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        let (r, timing) = key_bgra(&mut session, &bgra, stride, &hint_params, &mut scratch)?;
+        let wall = t.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "run {i}: {wall:6.1} ms total  |  preprocess {:5.2}  infer {:6.1}  pack {:5.2}",
+            timing.preprocess_us as f64 / 1000.0,
+            timing.infer_us as f64 / 1000.0,
+            timing.pack_us as f64 / 1000.0,
+        );
+        result = Some(r);
     }
     let result = result.unwrap();
 
