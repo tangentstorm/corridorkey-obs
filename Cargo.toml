@@ -1,0 +1,42 @@
+[package]
+name = "corridorkey-obs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Realtime CorridorKey neural green screen keyer as an OBS Studio filter"
+license = "CC-BY-NC-SA-4.0"
+
+[lib]
+name = "corridorkey_obs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "ndarray",
+    "std",
+    "download-binaries",
+    "tls-rustls",
+] }
+ndarray = "0.16"
+parking_lot = "0.12"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+cc = "1"
+
+[features]
+default = ["directml"]
+# DirectML runs on any DX12 GPU (NVIDIA, AMD, Intel iGPU) with no CUDA install.
+directml = ["ort/directml"]
+# Faster on NVIDIA, but requires a matching CUDA + cuDNN runtime on the machine.
+cuda = ["ort/cuda"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Deliberately NOT panic="abort": this DLL lives inside obs64.exe, and a bug in
+# the filter must not take the user's stream down. Every FFI entry point wraps
+# its body in catch_unwind instead.

@@ -1,0 +1,27 @@
+/target/
+
+# Upstream CorridorKey checkout and the OBS headers used as an ABI reference.
+# Both are fetched, not authored here — see README.
+/ref/
+
+# Exported ONNX models are ~136MB each and are derived from checkpoints under
+# the upstream non-commercial licence, so they are not redistributed here.
+# Regenerate with tools/export/export_onnx.py.
+/models/
+*.onnx
+
+# Output of examples/key_image
+/tests/data/*.keyed_*.png
+
+# Raw frame dumps from CORRIDORKEY_DUMP — these are captured camera frames.
+*.bgra
+
+/tools/export/.venv/
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

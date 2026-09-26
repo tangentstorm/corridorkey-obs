@@ -1,0 +1,122 @@
+// CorridorKey compositing + downscale shader.
+//
+// The neural net runs asynchronously at 512x512 on a worker thread. Everything
+// here runs on every frame at full resolution and is deliberately cheap:
+//
+//   Downscale  - box-filters the plate down to the model's input size.
+//   Draw       - upsamples the model's matte, recovers full-res detail in the
+//                solid interior, applies despill, and writes straight RGBA.
+
+uniform float4x4 ViewProj;
+
+uniform texture2d image;    // full-resolution plate, sRGB-encoded UNORM
+uniform texture2d key_tex;  // 512x512: rgb = straight foreground (sRGB), a = alpha
+
+// Downscale
+uniform float2 tap_step;    // texel offset between box-filter taps
+
+// Composite
+uniform float despill_strength;
+uniform int screen_channel; // 1 = green screen, 2 = blue screen
+uniform float fg_detail;    // 0 = model foreground everywhere, 1 = full-res plate where opaque
+uniform float matte_black;  // alpha values at/below this clamp to 0
+uniform float matte_white;  // alpha values at/above this clamp to 1
+uniform float bypass;       // 1 = pass the plate through untouched
+
+sampler_state linearClamp {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+// --- downscale ---------------------------------------------------------------
+// A single bilinear tap aliases hard at 1080p -> 512, and aliased green fringing
+// is exactly the signal the keyer is trying to reason about. A 3x3 box over the
+// source footprint is cheap and removes most of it.
+float4 PSDownscale(VertData v_in) : TARGET
+{
+	float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+	for (int y = -1; y <= 1; y++) {
+		for (int x = -1; x <= 1; x++) {
+			float2 off = float2(x, y) * tap_step;
+			sum += image.Sample(linearClamp, v_in.uv + off);
+		}
+	}
+	return sum / 9.0;
+}
+
+// --- composite ---------------------------------------------------------------
+
+// Luminance-preserving despill, matching CorridorKeyModule/core/color_utils.py:
+// subtract the screen channel's excess over the other two, then give half of
+// the removed energy back to each.
+float3 despill(float3 c, int channel, float strength)
+{
+	float s, a, b;
+	if (channel == 2) { s = c.b; a = c.r; b = c.g; }
+	else              { s = c.g; a = c.r; b = c.b; }
+
+	float limit = (a + b) * 0.5;
+	float spill = max(s - limit, 0.0) * strength;
+
+	s -= spill;
+	a += spill * 0.5;
+	b += spill * 0.5;
+
+	if (channel == 2) return float3(a, b, s);
+	return float3(a, s, b);
+}
+
+float4 PSComposite(VertData v_in) : TARGET
+{
+	float4 plate = image.Sample(linearClamp, v_in.uv);
+	float4 key   = key_tex.Sample(linearClamp, v_in.uv);
+
+	// Matte black/white point, the usual compositor controls for tightening a
+	// soft matte without touching the model.
+	float span  = max(matte_white - matte_black, 1e-4);
+	float alpha = saturate((key.a - matte_black) / span);
+
+	// In the solid interior the 512px prediction carries no detail the plate
+	// doesn't already have, so cross-fade back to the plate there and keep the
+	// model's unmixed color for the semi-transparent edges, which is the whole
+	// reason for running it.
+	float w = fg_detail * smoothstep(0.85, 1.0, alpha);
+	float3 fg = lerp(key.rgb, plate.rgb, w);
+
+	fg = despill(fg, screen_channel, despill_strength);
+
+	float4 keyed = float4(fg, alpha * plate.a);
+	return lerp(keyed, plate, bypass);
+}
+
+technique Downscale
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDownscale(v_in);
+	}
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSComposite(v_in);
+	}
+}
