@@ -79,6 +79,21 @@ Two other things worth knowing:
 You do **not** need an obs-studio source checkout. `build.rs` reads the export
 table out of your installed `obs.dll` and generates the import library itself.
 
+## Install (prebuilt)
+
+Grab the zip from [Releases](../../releases), then:
+
+1. Unzip it.
+2. Run `get-models.ps1` to fetch and convert the model. This needs
+   [uv](https://docs.astral.sh/uv/) and git, takes a few minutes, and pulls down
+   ~2GB of one-off conversion dependencies. The models are not shipped with the
+   plugin - they derive from the upstream checkpoints, which carry a
+   non-commercial licence, so the script fetches them from the author directly.
+3. Run `install.ps1`.
+4. Restart OBS and add **CorridorKey (Neural Green Screen)** as a filter.
+
+No compiler or Rust toolchain needed for that path.
+
 ## Build and install
 
 ```powershell

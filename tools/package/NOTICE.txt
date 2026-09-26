@@ -1,0 +1,45 @@
+CorridorKey for OBS
+===================
+
+This package contains the OBS plugin only. It contains no model weights.
+
+
+Upstream model
+--------------
+
+The neural network this plugin runs is CorridorKey, by Niko Pueringer:
+
+    https://github.com/nikopueringer/CorridorKey
+
+CorridorKey is released under a variation of CC BY-NC-SA 4.0 with commercial
+restrictions. In the author's words: you may process images commercially,
+including streaming, but you may not resell the tool or offer paid inference as
+a service without a written agreement.
+
+No checkpoint or derived model file is redistributed here. `get-models.ps1`
+downloads the checkpoints from the author's HuggingFace repositories and converts
+them on your machine:
+
+    https://huggingface.co/nikopueringer/CorridorKey_v1.0
+    https://huggingface.co/nikopueringer/CorridorKeyBlue_1.0
+
+The upstream licence applies to those files and to anything derived from them,
+including the ONNX models `get-models.ps1` produces. Check the upstream
+repository for the current terms before doing anything commercial with them.
+
+
+What this plugin adds
+---------------------
+
+The plugin around the model — the OBS integration, the ONNX export tooling, the
+chroma-key alpha hint, and the compositing shader — is this project's own work.
+It runs the network at a live-capable resolution rather than the 2048x2048 the
+upstream tool uses, so its output is not equivalent to running CorridorKey
+offline. For finishing work, use the upstream tool.
+
+
+Third-party components
+----------------------
+
+Inference uses ONNX Runtime (MIT), via the `ort` crate (MIT/Apache-2.0).
+The plugin links against libobs (GPL-2.0-or-later) as an OBS Studio plugin.
