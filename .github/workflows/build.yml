@@ -56,6 +56,13 @@ jobs:
       # environment explicitly avoids depending on the runner image's layout.
       - uses: ilammy/msvc-dev-cmd@v1
 
+      # src/obs.rs is hand-written FFI. A wrong enum value there is not a compile
+      # error and usually not a crash either, just a control that silently never
+      # appears; this catches that class of bug against the real headers.
+      - name: Check FFI constants against the OBS headers
+        shell: pwsh
+        run: python tools/check_obs_constants.py --obs-version $env:OBS_VERSION
+
       - name: Test
         shell: pwsh
         env:

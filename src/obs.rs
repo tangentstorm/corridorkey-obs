@@ -65,12 +65,27 @@ pub const GS_RENDER_TARGET: u32 = 1 << 2;
 pub const OBS_NO_DIRECT_RENDERING: i32 = 0;
 pub const OBS_ALLOW_DIRECT_RENDERING: i32 = 1;
 
+// enum obs_text_type. INFO is 3, not 2 - 2 is MULTILINE, which renders the
+// status line as a large editable text box instead of a label.
 pub const OBS_TEXT_DEFAULT: c_int = 0;
-pub const OBS_TEXT_INFO: c_int = 2;
+pub const OBS_TEXT_PASSWORD: c_int = 1;
+pub const OBS_TEXT_MULTILINE: c_int = 2;
+pub const OBS_TEXT_INFO: c_int = 3;
 
-pub const OBS_COMBO_TYPE_LIST: c_int = 1;
+// enum obs_combo_type. Spelled out in full because getting LIST wrong is silent:
+// OBS rejects an EDITABLE list with a non-string format by returning NULL, and
+// the property simply never appears in the UI.
+pub const OBS_COMBO_TYPE_INVALID: c_int = 0;
+pub const OBS_COMBO_TYPE_EDITABLE: c_int = 1;
+pub const OBS_COMBO_TYPE_LIST: c_int = 2;
+pub const OBS_COMBO_TYPE_RADIO: c_int = 3;
+
+// enum obs_combo_format
+pub const OBS_COMBO_FORMAT_INVALID: c_int = 0;
 pub const OBS_COMBO_FORMAT_INT: c_int = 1;
+pub const OBS_COMBO_FORMAT_FLOAT: c_int = 2;
 pub const OBS_COMBO_FORMAT_STRING: c_int = 3;
+pub const OBS_COMBO_FORMAT_BOOL: c_int = 4;
 
 pub const LOG_ERROR: c_int = 100;
 pub const LOG_WARNING: c_int = 200;
