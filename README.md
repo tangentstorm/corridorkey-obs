@@ -4,6 +4,12 @@ A realtime OBS Studio filter that keys a green (or blue) screen with
 [CorridorKey](https://github.com/nikopueringer/CorridorKey)'s neural unmixing
 model, written in Rust.
 
+> **No support.** This is shared as-is, and I don't provide help with it — please
+> don't open issues asking for setup help. Windows users can use the installer
+> from the [latest release](../../releases/tag/latest). For anything else (other platforms, other OBS
+> versions, building it yourself), use the source code, or point an AI coding
+> agent at this repository and let it figure it out.
+
 Traditional chroma keys decide how opaque each pixel is. CorridorKey's model does
 something harder: for every pixel — including motion blur, out-of-focus edges and
 single strands of hair — it predicts both a linear alpha *and* the true
@@ -81,18 +87,17 @@ table out of your installed `obs.dll` and generates the import library itself.
 
 ## Install (prebuilt)
 
-Grab the zip from [Releases](../../releases), then:
+Download [`corridorkey-obs-setup.exe`](../../releases/download/latest/corridorkey-obs-setup.exe)
+from the [latest release](../../releases/tag/latest) and run it with OBS closed.
+It installs the plugin into `%ProgramData%\obs-studio\plugins\corridorkey-obs`.
 
-1. Unzip it.
-2. Run `get-models.ps1` to fetch and convert the model. This needs
-   [uv](https://docs.astral.sh/uv/) and git, takes a few minutes, and pulls down
-   ~2GB of one-off conversion dependencies. The models are not shipped with the
-   plugin - they derive from the upstream checkpoints, which carry a
-   non-commercial licence, so the script fetches them from the author directly.
-3. Run `install.ps1`.
-4. Restart OBS and add **CorridorKey (Neural Green Screen)** as a filter.
-
-No compiler or Rust toolchain needed for that path.
+**The installer does not include the models.** They derive from the upstream
+CorridorKey checkpoints, which carry a non-commercial licence, so they aren't
+redistributed here. Generate them with steps 1 and 2 of
+[Build and install](#build-and-install) below, and copy the `.onnx` files into
+`%ProgramData%\obs-studio\plugins\corridorkey-obs\data\models`. Until at least one
+is there, the filter loads but passes video through untouched, and says so in its
+properties panel.
 
 ## Build and install
 

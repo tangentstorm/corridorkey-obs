@@ -3,7 +3,6 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -112,46 +111,58 @@ jobs:
           path: dist/corridorkey-obs
           if-no-files-found: error
 
+      # Inno Setup is not reliably present on the runner image, so install it.
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $crate = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $version = "$crate+$($env:GITHUB_SHA.Substring(0, 7))"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp `
+            "/DStage=$env:GITHUB_WORKSPACE\dist\corridorkey-obs" "/DAppVersion=$version" `
+            "/O$env:GITHUB_WORKSPACE\dist\installer" tools\package\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corridorkey-obs-setup
+          path: dist/installer
+          if-no-files-found: error
+
+  # A single rolling release, replaced on every push to main, so the download
+  # link in the README never changes. It carries only the installer: no models.
   release:
-    name: publish release
+    name: publish latest
     needs: [build]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: corridorkey-obs-windows-x64
-          path: pkg
+          name: corridorkey-obs-setup
+          path: setup
 
-      - name: Zip
+      - name: Replace the latest release
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          mkdir -p out
-          (cd pkg && zip -r "../out/corridorkey-obs-${version}-windows-x64.zip" .)
-          ls -lh out
+          cat > notes.md <<'NOTES'
+          Windows installer for the CorridorKey OBS filter, built from the commit in
+          the title. Rebuilt on every push to main.
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: out/*
-          generate_release_notes: true
-          body: |
-            ## Install
+          **No support is provided.** See the README.
 
-            1. Download and unzip `corridorkey-obs-<version>-windows-x64.zip`.
-            2. Run `get-models.ps1` to fetch and convert the model (needs Python
-               via [uv](https://docs.astral.sh/uv/) and git; takes a few minutes
-               and downloads ~2GB of build-time dependencies).
-            3. Run `install.ps1`.
-            4. Restart OBS and add **CorridorKey (Neural Green Screen)** as a
-               filter on your camera source.
+          Run `corridorkey-obs-setup.exe` with OBS closed. Requires OBS Studio
+          ${{ env.OBS_VERSION }}.x on Windows and a DX12 GPU.
 
-            No compiler or Rust toolchain needed for the plugin itself.
-            Requires OBS Studio ${{ env.OBS_VERSION }}.x on Windows and a DX12 GPU.
-
-            The models are **not** distributed here: they derive from the
-            [CorridorKey](https://github.com/nikopueringer/CorridorKey)
-            checkpoints by Niko Pueringer, which carry a CC BY-NC-SA 4.0 variant.
-            `get-models.ps1` fetches them from the author's HuggingFace directly.
-            See `NOTICE.txt`.
+          **No models are included.** They derive from Niko Pueringer's
+          [CorridorKey](https://github.com/nikopueringer/CorridorKey) checkpoints,
+          which carry a non-commercial licence, so you have to generate them
+          yourself from the source in this repository. Without them the filter
+          loads but passes video through untouched.
+          NOTES
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest setup/corridorkey-obs-setup.exe --target "$GITHUB_SHA" --latest --title "Latest build (${GITHUB_SHA::7})" --notes-file notes.md
