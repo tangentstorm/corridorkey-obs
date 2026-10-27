@@ -72,6 +72,11 @@ pub const OBS_TEXT_PASSWORD: c_int = 1;
 pub const OBS_TEXT_MULTILINE: c_int = 2;
 pub const OBS_TEXT_INFO: c_int = 3;
 
+// enum obs_path_type
+pub const OBS_PATH_FILE: c_int = 0;
+pub const OBS_PATH_FILE_SAVE: c_int = 1;
+pub const OBS_PATH_DIRECTORY: c_int = 2;
+
 // enum obs_combo_type. Spelled out in full because getting LIST wrong is silent:
 // OBS rejects an EDITABLE list with a non-string format by returning NULL, and
 // the property simply never appears in the UI.
@@ -226,7 +231,6 @@ extern "C" {
     pub fn obs_data_set_default_int(data: *mut obs_data_t, name: *const c_char, val: i64);
     pub fn obs_data_set_default_bool(data: *mut obs_data_t, name: *const c_char, val: bool);
     pub fn obs_data_set_default_string(data: *mut obs_data_t, name: *const c_char, val: *const c_char);
-
     // properties
     pub fn obs_properties_create() -> *mut obs_properties_t;
     pub fn obs_properties_add_bool(
@@ -262,6 +266,14 @@ extern "C" {
         name: *const c_char,
         desc: *const c_char,
         text_type: c_int,
+    ) -> *mut obs_property_t;
+    pub fn obs_properties_add_path(
+        props: *mut obs_properties_t,
+        name: *const c_char,
+        desc: *const c_char,
+        path_type: c_int,
+        filter: *const c_char,
+        default_path: *const c_char,
     ) -> *mut obs_property_t;
     pub fn obs_property_list_add_int(
         prop: *mut obs_property_t,

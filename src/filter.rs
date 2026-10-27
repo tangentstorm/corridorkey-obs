@@ -35,6 +35,7 @@ const S_MATTE_WHITE: &CStr = c"matte_white";
 const S_BYPASS: &CStr = c"bypass";
 const S_DEVICE: &CStr = c"gpu_device";
 const S_QUALITY: &CStr = c"quality";
+const S_MODELS_DIR: &CStr = c"models_dir";
 
 #[derive(Clone, Copy)]
 struct Settings {
@@ -121,6 +122,10 @@ pub struct Filter {
     engine_screen: ScreenColor,
     engine_device: i32,
     engine_size: usize,
+    /// Folder the user pointed the filter at, searched before the plugin's own
+    /// data/models. Kept out of `Settings` so that stays `Copy`.
+    models_dir: String,
+    engine_models_dir: String,
 
     effect: *mut gs_effect_t,
     params: Option<EffectParams>,
@@ -154,16 +159,30 @@ impl Filter {
     /// the float32 export. Measured on an RTX 4050 via DirectML the gain is
     /// modest — roughly 200ms to 150ms — but it is free, and it halves both the
     /// file and the VRAM footprint.
-    fn model_path(screen: ScreenColor, size: usize) -> Option<PathBuf> {
-        let name = |suffix: &str| {
-            format!("models/corridorkey_{}_{}{}.onnx", screen.as_str(), size, suffix)
-        };
-        module_file(&name("_fp16")).or_else(|| module_file(&name("")))
+    ///
+    /// A user-chosen folder wins over the plugin's own data/models, so models
+    /// built anywhere (a source checkout, another machine) can be used in place.
+    /// Its `models` subfolder is searched too, so picking the root of a source
+    /// checkout works.
+    fn model_path(models_dir: &str, screen: ScreenColor, size: usize) -> Option<PathBuf> {
+        let name = |suffix: &str| format!("corridorkey_{}_{}{}.onnx", screen.as_str(), size, suffix);
+        let names = [name("_fp16"), name("")];
+
+        if !models_dir.is_empty() {
+            let dir = PathBuf::from(models_dir);
+            for d in [dir.clone(), dir.join("models")] {
+                if let Some(p) = names.iter().map(|n| d.join(n)).find(|p| p.is_file()) {
+                    return Some(p);
+                }
+            }
+        }
+        names.iter().find_map(|n| module_file(&format!("models/{n}")))
     }
 
     fn start_engine(&mut self, screen: ScreenColor, device_id: i32, size: usize) {
         self.engine = None; // drop the old worker (and its model) before loading another
-        match Self::model_path(screen, size) {
+        self.engine_models_dir = self.models_dir.clone();
+        match Self::model_path(&self.models_dir, screen, size) {
             Some(path) => {
                 log::info(&format!(
                     "starting {} engine at {size}x{size} from {}",
@@ -183,10 +202,12 @@ impl Filter {
                 self.engine_size = 0;
                 log::error(&format!(
                     "no {}-screen model at {size}x{size}. Expected \
-                     <obs-plugins>/corridorkey-obs/models/corridorkey_{}_{size}_fp16.onnx — \
+                     corridorkey_{}_{size}_fp16.onnx in the filter's Models folder ({}) \
+                     or <obs-plugins>/corridorkey-obs/models — \
                      generate it with: export_onnx.py --size {size} --color {} --fp16",
                     screen.as_str(),
                     screen.as_str(),
+                    if self.models_dir.is_empty() { "not set" } else { &self.models_dir },
                     screen.as_str()
                 ));
             }
@@ -304,14 +325,22 @@ impl Filter {
                     if INFER_SIZES.contains(&want) { want } else { DEFAULT_INFER_SIZE }
                 },
             };
+            let dir = obs_data_get_string(data, S_MODELS_DIR.as_ptr());
+            self.models_dir = if dir.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(dir).to_string_lossy().trim().to_string()
+            };
         }
 
         // Green and blue are different checkpoints, and the device is baked into
-        // the session, so either change means building a new one.
+        // the session, so either change means building a new one. So does
+        // pointing at a different models folder.
         if self.engine.is_none()
             || self.engine_screen != self.settings.screen
             || self.engine_device != self.settings.device_id
             || self.engine_size != self.settings.infer_size
+            || self.engine_models_dir != self.models_dir
         {
             let s = self.settings;
             self.start_engine(s.screen, s.device_id, s.infer_size);
@@ -550,6 +579,8 @@ unsafe extern "C" fn create(settings: *mut obs_data_t, source: *mut obs_source_t
             engine_screen: ScreenColor::Green,
             engine_device: -1,
             engine_size: 0,
+            models_dir: String::new(),
+            engine_models_dir: String::new(),
             effect: ptr::null_mut(),
             params: None,
             small: ptr::null_mut(),
@@ -612,6 +643,7 @@ unsafe extern "C" fn get_defaults(settings: *mut obs_data_t) {
         obs_data_set_default_bool(settings, S_BYPASS.as_ptr(), d.bypass);
         obs_data_set_default_int(settings, S_DEVICE.as_ptr(), d.device_id as i64);
         obs_data_set_default_int(settings, S_QUALITY.as_ptr(), d.infer_size as i64);
+        obs_data_set_default_string(settings, S_MODELS_DIR.as_ptr(), c"".as_ptr());
     })
 }
 
@@ -646,6 +678,22 @@ unsafe extern "C" fn get_properties(data: *mut c_void) -> *mut obs_properties_t 
         obs_property_set_long_description(
             quality,
             c"Resolution the network runs at. Lower is faster, which cuts how far the matte               lags the picture - that lag is what leaves an outline trailing a moving arm.               Raise it if edges look soft, lower it if movement ghosts. Changing this loads               a different model."
+                .as_ptr(),
+        );
+
+        let models = obs_properties_add_path(
+            props,
+            S_MODELS_DIR.as_ptr(),
+            c"Models folder".as_ptr(),
+            OBS_PATH_DIRECTORY,
+            ptr::null(),
+            ptr::null(),
+        );
+        obs_property_set_long_description(
+            models,
+            c"Folder holding the corridorkey_<green|blue>_<size>_fp16.onnx files, or a \
+              folder with a models subfolder that does. Searched before the plugin's own \
+              data\\models folder. Changing this reloads the model."
                 .as_ptr(),
         );
 
@@ -750,7 +798,15 @@ unsafe extern "C" fn get_properties(data: *mut c_void) -> *mut obs_properties_t 
                     "Model failed to load: {}",
                     e.error().unwrap_or_else(|| "unknown error".into())
                 ),
-                None => "No model found. See the plugin README.".to_string(),
+                None => {
+                    let s = filter.settings;
+                    format!(
+                        "No model found: set Models folder to a folder containing \
+                         corridorkey_{}_{}_fp16.onnx. Without it, video passes through untouched.",
+                        s.screen.as_str(),
+                        s.infer_size
+                    )
+                }
             };
             if let Ok(c) = CString::new(text) {
                 obs_properties_add_text(props, c"status".as_ptr(), c.as_ptr(), OBS_TEXT_INFO);

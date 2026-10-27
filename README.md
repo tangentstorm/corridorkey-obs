@@ -94,10 +94,10 @@ It installs the plugin into `%ProgramData%\obs-studio\plugins\corridorkey-obs`.
 **The installer does not include the models.** They derive from the upstream
 CorridorKey checkpoints, which carry a non-commercial licence, so they aren't
 redistributed here. Generate them with steps 1 and 2 of
-[Build and install](#build-and-install) below, and copy the `.onnx` files into
-`%ProgramData%\obs-studio\plugins\corridorkey-obs\data\models`. Until at least one
-is there, the filter loads but passes video through untouched, and says so in its
-properties panel.
+[Build and install](#build-and-install) below, then point the filter's **Models
+folder** setting at the folder they're in (or copy them into
+`%ProgramData%\obs-studio\plugins\corridorkey-obs\data\models`). Until the filter
+finds one, it passes video through untouched, and says so in its properties panel.
 
 ## Build and install
 
@@ -135,6 +135,7 @@ instead, from an elevated shell.
 | Setting | What it does |
 |---|---|
 | **Quality / speed** | 512 / 384 / 256px. The main lever on how far the matte lags the picture. See Performance. |
+| **Models folder** | Where to find the `.onnx` models, if not in the plugin's own `data\models`. A folder with a `models` subfolder (like a source checkout) works too. |
 | **Screen color** | Green or blue. Selects the checkpoint *and* the despill channel; switching reloads the model. |
 | **Hint: similarity** | How close a pixel's chroma must be to the screen color to seed the hint as background. Raise if your subject is being eaten, lower if the screen isn't detected. |
 | **Hint: smoothness** | Width of the ramp between the two. |
