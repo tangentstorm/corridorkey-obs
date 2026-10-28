@@ -39,7 +39,7 @@ impl ScreenColor {
     }
 
     /// Reference chroma (U, V) of a fully saturated screen, BT.709.
-    fn key_uv(self) -> (f32, f32) {
+    pub fn key_uv(self) -> (f32, f32) {
         match self {
             ScreenColor::Green => rgb_to_uv(0.0, 1.0, 0.0),
             ScreenColor::Blue => rgb_to_uv(0.0, 0.0, 1.0),
@@ -72,7 +72,7 @@ impl Default for HintParams {
 /// hint depend on hue and saturation only.
 ///
 /// Near-black pixels have no meaningful hue; callers handle those separately.
-fn rgb_to_uv(r: f32, g: f32, b: f32) -> (f32, f32) {
+pub fn rgb_to_uv(r: f32, g: f32, b: f32) -> (f32, f32) {
     let m = r.max(g).max(b).max(1e-6);
     let (r, g, b) = (r / m, g / m, b / m);
     let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -83,7 +83,7 @@ fn rgb_to_uv(r: f32, g: f32, b: f32) -> (f32, f32) {
 /// foreground: near-black is far more often deep shadow on the subject (hair,
 /// dark clothing) than it is screen, and the model can erode a too-generous
 /// hint far more easily than it can invent detail a too-tight one removed.
-const BLACK_FLOOR: f32 = 5.0 / 255.0;
+pub const BLACK_FLOOR: f32 = 5.0 / 255.0;
 
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     if edge1 <= edge0 {

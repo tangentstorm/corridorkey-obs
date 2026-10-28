@@ -16,6 +16,7 @@ use std::ffi::{c_char, c_float, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::ptr;
 
+use crate::composite::{CorrectionMode, DespillMode};
 use crate::engine::{Engine, Status, DEFAULT_INFER_SIZE, INFER_SIZES};
 use crate::hint::{HintParams, ScreenColor};
 use crate::obs::*;
@@ -29,6 +30,7 @@ const S_SCREEN: &CStr = c"screen_color";
 const S_SIMILARITY: &CStr = c"similarity";
 const S_SMOOTHNESS: &CStr = c"smoothness";
 const S_DESPILL: &CStr = c"despill";
+const S_DESPILL_MODE: &CStr = c"despill_mode";
 const S_FG_DETAIL: &CStr = c"fg_detail";
 const S_MATTE_BLACK: &CStr = c"matte_black";
 const S_MATTE_WHITE: &CStr = c"matte_white";
@@ -36,6 +38,20 @@ const S_BYPASS: &CStr = c"bypass";
 const S_DEVICE: &CStr = c"gpu_device";
 const S_QUALITY: &CStr = c"quality";
 const S_MODELS_DIR: &CStr = c"models_dir";
+// Same-frame GPU matte correction (see composite::correct_alpha).
+const S_CORRECT_MODE: &CStr = c"correct_mode";
+const S_VETO_STRENGTH: &CStr = c"veto_strength";
+const S_FILL_STRENGTH: &CStr = c"fill_strength";
+const S_CORRECT_SIMILARITY: &CStr = c"correct_similarity";
+const S_CORRECT_SMOOTHNESS: &CStr = c"correct_smoothness";
+const S_CHANGE_GATE: &CStr = c"change_gate";
+const S_CHANGE_THRESHOLD: &CStr = c"change_threshold";
+const S_SPATIAL_GATE: &CStr = c"spatial_gate";
+const S_CORRECT_REACH: &CStr = c"correct_reach";
+// Frame-synced plate delay ("nuclear option"): composite the exact plate
+// frame each matte was computed from instead of the live one.
+const S_SYNC_DELAY: &CStr = c"sync_delay";
+const S_DELAY_BUFFER: &CStr = c"delay_buffer_frames";
 
 #[derive(Clone, Copy)]
 struct Settings {
@@ -43,10 +59,22 @@ struct Settings {
     similarity: f32,
     smoothness: f32,
     despill: f32,
+    despill_mode: DespillMode,
     fg_detail: f32,
     matte_black: f32,
     matte_white: f32,
     bypass: bool,
+    correct_mode: CorrectionMode,
+    veto_strength: f32,
+    fill_strength: f32,
+    correct_similarity: f32,
+    correct_smoothness: f32,
+    change_gate: f32,
+    change_threshold: f32,
+    spatial_gate: f32,
+    correct_reach: f32,
+    sync_delay: bool,
+    delay_buffer: usize,
     device_id: i32,
     /// Inference resolution. Larger is a better matte; smaller is less lag,
     /// which on a slower GPU is the difference between clean edges and visible
@@ -61,10 +89,22 @@ impl Default for Settings {
             similarity: 0.30,
             smoothness: 0.12,
             despill: 1.0,
+            despill_mode: DespillMode::Legacy,
             fg_detail: 1.0,
             matte_black: 0.0,
             matte_white: 1.0,
             bypass: false,
+            correct_mode: CorrectionMode::Off,
+            veto_strength: 1.0,
+            fill_strength: 1.0,
+            correct_similarity: 0.30,
+            correct_smoothness: 0.12,
+            change_gate: 1.0,
+            change_threshold: 0.08,
+            spatial_gate: 1.0,
+            correct_reach: 8.0,
+            sync_delay: false,
+            delay_buffer: 32,
             device_id: -1, // -1 = let ONNX Runtime pick the adapter
             infer_size: DEFAULT_INFER_SIZE,
         }
@@ -89,11 +129,25 @@ struct EffectParams {
     key_tex: *mut gs_eparam_t,
     tap_step: *mut gs_eparam_t,
     despill_strength: *mut gs_eparam_t,
+    despill_mode: *mut gs_eparam_t,
     screen_channel: *mut gs_eparam_t,
     fg_detail: *mut gs_eparam_t,
     matte_black: *mut gs_eparam_t,
     matte_white: *mut gs_eparam_t,
     bypass: *mut gs_eparam_t,
+    matte_plate_tex: *mut gs_eparam_t,
+    correct_mode: *mut gs_eparam_t,
+    veto_strength: *mut gs_eparam_t,
+    fill_strength: *mut gs_eparam_t,
+    key_uv: *mut gs_eparam_t,
+    correct_similarity: *mut gs_eparam_t,
+    correct_smoothness: *mut gs_eparam_t,
+    change_gate: *mut gs_eparam_t,
+    change_threshold: *mut gs_eparam_t,
+    spatial_gate: *mut gs_eparam_t,
+    reach_offset: *mut gs_eparam_t,
+    delayed_tex: *mut gs_eparam_t,
+    use_delayed: *mut gs_eparam_t,
 }
 
 impl EffectParams {
@@ -103,13 +157,35 @@ impl EffectParams {
             key_tex: p(c"key_tex"),
             tap_step: p(c"tap_step"),
             despill_strength: p(c"despill_strength"),
+            despill_mode: p(c"despill_mode"),
             screen_channel: p(c"screen_channel"),
             fg_detail: p(c"fg_detail"),
             matte_black: p(c"matte_black"),
             matte_white: p(c"matte_white"),
             bypass: p(c"bypass"),
+            matte_plate_tex: p(c"matte_plate_tex"),
+            correct_mode: p(c"correct_mode"),
+            veto_strength: p(c"veto_strength"),
+            fill_strength: p(c"fill_strength"),
+            key_uv: p(c"key_uv"),
+            correct_similarity: p(c"correct_similarity"),
+            correct_smoothness: p(c"correct_smoothness"),
+            change_gate: p(c"change_gate"),
+            change_threshold: p(c"change_threshold"),
+            spatial_gate: p(c"spatial_gate"),
+            reach_offset: p(c"reach_offset"),
+            delayed_tex: p(c"delayed_tex"),
+            use_delayed: p(c"use_delayed"),
         }
     }
+}
+
+/// One retained full-resolution plate frame in the sync-delay ring.
+struct DelaySlot {
+    texrender: *mut gs_texrender_t,
+    frame_id: u64,
+    width: u32,
+    height: u32,
 }
 
 pub struct Filter {
@@ -146,6 +222,20 @@ pub struct Filter {
     buffer_size: usize,
 
     key_tex: *mut gs_texture_t,
+    /// The downscaled plate the newest matte was computed from, for the
+    /// correction change gate. Uploaded alongside `key_tex`.
+    matte_plate_tex: *mut gs_texture_t,
+
+    /// Monotonic counter incremented once per rendered frame; tags staged
+    /// analysis frames and ring-buffer plates so a finished matte can be
+    /// paired with the exact plate it belongs to (sync delay).
+    frame_counter: u64,
+    /// Frame id of the image currently in each staging slot.
+    stage_frame: [u64; 2],
+    /// Full-resolution plate history for sync delay. Created lazily, only
+    /// while the setting is on. Each slot costs a full frame of VRAM.
+    delay_ring: Vec<DelaySlot>,
+    delay_next: usize,
     /// Scratch buffer for the mapped surface, reused every frame.
     readback: Vec<u8>,
     /// Debug: set CORRIDORKEY_DUMP to a path to write the first frame the model
@@ -231,10 +321,15 @@ impl Filter {
         if !self.key_tex.is_null() {
             gs_texture_destroy(self.key_tex);
         }
+        if !self.matte_plate_tex.is_null() {
+            gs_texture_destroy(self.matte_plate_tex);
+        }
         for slot in self.stage.iter_mut() {
             *slot = gs_stagesurface_create(size as u32, size as u32, GS_BGRA);
         }
         self.key_tex =
+            gs_texture_create(size as u32, size as u32, GS_RGBA, 1, ptr::null(), GS_DYNAMIC);
+        self.matte_plate_tex =
             gs_texture_create(size as u32, size as u32, GS_RGBA, 1, ptr::null(), GS_DYNAMIC);
         obs_leave_graphics();
 
@@ -293,6 +388,14 @@ impl Filter {
         if !self.key_tex.is_null() {
             gs_texture_destroy(self.key_tex);
         }
+        if !self.matte_plate_tex.is_null() {
+            gs_texture_destroy(self.matte_plate_tex);
+        }
+        for slot in self.delay_ring.drain(..) {
+            if !slot.texrender.is_null() {
+                gs_texrender_destroy(slot.texrender);
+            }
+        }
         if !self.effect.is_null() {
             gs_effect_destroy(self.effect);
         }
@@ -314,10 +417,39 @@ impl Filter {
                 similarity: obs_data_get_double(data, S_SIMILARITY.as_ptr()) as f32,
                 smoothness: obs_data_get_double(data, S_SMOOTHNESS.as_ptr()) as f32,
                 despill: obs_data_get_double(data, S_DESPILL.as_ptr()) as f32,
+                despill_mode: {
+                    let s = obs_data_get_string(data, S_DESPILL_MODE.as_ptr());
+                    if s.is_null() {
+                        DespillMode::Legacy
+                    } else {
+                        DespillMode::from_str(&CStr::from_ptr(s).to_string_lossy())
+                    }
+                },
                 fg_detail: obs_data_get_double(data, S_FG_DETAIL.as_ptr()) as f32,
                 matte_black: obs_data_get_double(data, S_MATTE_BLACK.as_ptr()) as f32,
                 matte_white: obs_data_get_double(data, S_MATTE_WHITE.as_ptr()) as f32,
                 bypass: obs_data_get_bool(data, S_BYPASS.as_ptr()),
+                correct_mode: {
+                    let s = obs_data_get_string(data, S_CORRECT_MODE.as_ptr());
+                    if s.is_null() {
+                        CorrectionMode::Off
+                    } else {
+                        CorrectionMode::from_str(&CStr::from_ptr(s).to_string_lossy())
+                    }
+                },
+                veto_strength: obs_data_get_double(data, S_VETO_STRENGTH.as_ptr()) as f32,
+                fill_strength: obs_data_get_double(data, S_FILL_STRENGTH.as_ptr()) as f32,
+                correct_similarity: obs_data_get_double(data, S_CORRECT_SIMILARITY.as_ptr())
+                    as f32,
+                correct_smoothness: obs_data_get_double(data, S_CORRECT_SMOOTHNESS.as_ptr())
+                    as f32,
+                change_gate: obs_data_get_double(data, S_CHANGE_GATE.as_ptr()) as f32,
+                change_threshold: obs_data_get_double(data, S_CHANGE_THRESHOLD.as_ptr()) as f32,
+                spatial_gate: obs_data_get_double(data, S_SPATIAL_GATE.as_ptr()) as f32,
+                correct_reach: obs_data_get_int(data, S_CORRECT_REACH.as_ptr()) as f32,
+                sync_delay: obs_data_get_bool(data, S_SYNC_DELAY.as_ptr()),
+                delay_buffer: (obs_data_get_int(data, S_DELAY_BUFFER.as_ptr()) as usize)
+                    .clamp(4, 120),
                 device_id: obs_data_get_int(data, S_DEVICE.as_ptr()) as i32,
                 infer_size: {
                     // Guard against a settings file naming a size we no longer ship.
@@ -411,6 +543,7 @@ impl Filter {
         let small_tex = gs_texrender_get_texture(self.small);
         if !small_tex.is_null() {
             gs_stage_texture(self.stage[self.stage_idx], small_tex);
+            self.stage_frame[self.stage_idx] = self.frame_counter;
             self.stage_idx = 1 - self.stage_idx;
             self.stage_primed = true;
         }
@@ -469,8 +602,65 @@ impl Filter {
         }
         if let Some(engine) = self.engine.as_ref() {
             let buf = std::mem::take(&mut self.readback);
-            engine.submit(buf, linesize as usize, self.settings.hint());
+            engine.submit(buf, linesize as usize, self.settings.hint(), self.stage_frame[slot]);
         }
+    }
+
+    /// Capture the full-resolution input into the sync-delay ring, tagged with
+    /// the current frame counter. A whole extra full-res pass per frame while
+    /// sync delay is on; slots are created lazily and cost a frame of VRAM
+    /// each, so the buffer setting is also the memory knob.
+    unsafe fn capture_delay_frame(&mut self, width: u32, height: u32) {
+        let want = self.settings.delay_buffer.max(1);
+        while self.delay_ring.len() < want {
+            let tr = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+            if tr.is_null() {
+                log::error("failed to create sync-delay texrender; disabling ring growth");
+                break;
+            }
+            self.delay_ring
+                .push(DelaySlot { texrender: tr, frame_id: u64::MAX, width: 0, height: 0 });
+        }
+        if self.delay_ring.is_empty() {
+            return;
+        }
+        let idx = self.delay_next % want.min(self.delay_ring.len());
+        self.delay_next = self.delay_next.wrapping_add(1);
+        let tr = self.delay_ring[idx].texrender;
+
+        if !obs_source_process_filter_begin(self.source, GS_BGRA, OBS_NO_DIRECT_RENDERING) {
+            return;
+        }
+        gs_texrender_reset(tr);
+        if !gs_texrender_begin(tr, width, height) {
+            obs_source_process_filter_tech_end(
+                self.source,
+                self.effect,
+                width,
+                height,
+                c"Capture".as_ptr(),
+            );
+            return;
+        }
+        let clear = Vec4::default();
+        gs_clear(GS_CLEAR_COLOR, &clear, 0.0, 0);
+        gs_ortho(0.0, width as f32, 0.0, height as f32, -100.0, 100.0);
+        gs_blend_state_push();
+        gs_enable_blending(false);
+        obs_source_process_filter_tech_end(
+            self.source,
+            self.effect,
+            width,
+            height,
+            c"Capture".as_ptr(),
+        );
+        gs_blend_state_pop();
+        gs_texrender_end(tr);
+
+        let slot = &mut self.delay_ring[idx];
+        slot.frame_id = self.frame_counter;
+        slot.width = width;
+        slot.height = height;
     }
 
     unsafe fn render(&mut self) {
@@ -496,6 +686,7 @@ impl Filter {
             obs_source_skip_video_filter(source);
             return;
         }
+        self.frame_counter = self.frame_counter.wrapping_add(1);
 
         // Read back the frame staged last time and, if the worker is free, hand it
         // over; then immediately stage a fresh one into the other surface.
@@ -514,16 +705,48 @@ impl Filter {
         if self.stage_primed {
             self.drain_staged_frame(1 - self.stage_idx);
         }
+        if self.settings.sync_delay {
+            self.capture_delay_frame(width, height);
+        }
         self.run_analysis_pass(width, height);
 
-        // Upload the newest finished matte.
-        if let Some(result) = self.engine.as_ref().and_then(|e| e.latest()) {
+        // Upload the newest finished matte, plus the plate it was computed
+        // from (the correction change gate diffs the live plate against it).
+        let latest = self.engine.as_ref().and_then(|e| e.latest());
+        if let Some(result) = latest.as_ref() {
             gs_texture_set_image(
                 self.key_tex,
                 result.rgba.as_ptr(),
                 (self.buffer_size * 4) as u32,
                 false,
             );
+            if !result.plate.is_empty() && !self.matte_plate_tex.is_null() {
+                gs_texture_set_image(
+                    self.matte_plate_tex,
+                    result.plate.as_ptr(),
+                    (self.buffer_size * 4) as u32,
+                    false,
+                );
+            }
+        }
+
+        // Sync delay: find the retained plate frame this matte belongs to.
+        // No match (evicted, resized, or not captured yet) falls back to the
+        // live plate, i.e. ordinary laggy-but-current compositing.
+        let mut delayed_tex: *mut gs_texture_t = ptr::null_mut();
+        if self.settings.sync_delay {
+            if let Some(result) = latest.as_ref() {
+                for slot in &self.delay_ring {
+                    if slot.frame_id == result.frame_id
+                        && slot.width == width
+                        && slot.height == height
+                        && !slot.texrender.is_null()
+                    {
+                        delayed_tex = gs_texrender_get_texture(slot.texrender);
+                        break;
+                    }
+                }
+            }
         }
 
         // Output through OBS's own filter plumbing rather than drawing the
@@ -538,11 +761,56 @@ impl Filter {
         let s = self.settings;
         gs_effect_set_texture(params.key_tex, self.key_tex);
         gs_effect_set_float(params.despill_strength, s.despill as c_float);
+        gs_effect_set_int(
+            params.despill_mode,
+            match s.despill_mode {
+                DespillMode::Legacy => 0,
+                DespillMode::Plate => 1,
+                DespillMode::Clamp => 2,
+                DespillMode::PlateClamp => 3,
+            },
+        );
         gs_effect_set_int(params.screen_channel, s.screen.channel() as i32);
         gs_effect_set_float(params.fg_detail, s.fg_detail as c_float);
         gs_effect_set_float(params.matte_black, s.matte_black as c_float);
         gs_effect_set_float(params.matte_white, s.matte_white as c_float);
         gs_effect_set_float(params.bypass, 0.0);
+
+        gs_effect_set_texture(params.matte_plate_tex, self.matte_plate_tex);
+        gs_effect_set_int(
+            params.correct_mode,
+            match s.correct_mode {
+                CorrectionMode::Off => 0,
+                CorrectionMode::Veto => 1,
+                CorrectionMode::Fill => 2,
+                CorrectionMode::Both => 3,
+            },
+        );
+        gs_effect_set_float(params.veto_strength, s.veto_strength as c_float);
+        gs_effect_set_float(params.fill_strength, s.fill_strength as c_float);
+        let (ku, kv) = s.screen.key_uv();
+        gs_effect_set_vec2(params.key_uv, &Vec2 { x: ku, y: kv });
+        gs_effect_set_float(params.correct_similarity, s.correct_similarity as c_float);
+        gs_effect_set_float(params.correct_smoothness, s.correct_smoothness as c_float);
+        gs_effect_set_float(params.change_gate, s.change_gate as c_float);
+        gs_effect_set_float(params.change_threshold, s.change_threshold as c_float);
+        gs_effect_set_float(params.spatial_gate, s.spatial_gate as c_float);
+        let reach = if self.buffer_size > 0 {
+            s.correct_reach / self.buffer_size as f32
+        } else {
+            0.0
+        };
+        gs_effect_set_vec2(params.reach_offset, &Vec2 { x: reach, y: reach });
+        // Bind a harmless placeholder when there is no delayed frame; the
+        // shader only samples it while use_delayed is on.
+        gs_effect_set_texture(
+            params.delayed_tex,
+            if delayed_tex.is_null() { self.key_tex } else { delayed_tex },
+        );
+        gs_effect_set_float(
+            params.use_delayed,
+            if delayed_tex.is_null() { 0.0 } else { 1.0 },
+        );
 
         obs_source_process_filter_end(source, self.effect, width, height);
     }
@@ -589,6 +857,11 @@ unsafe extern "C" fn create(settings: *mut obs_data_t, source: *mut obs_source_t
             stage_primed: false,
             buffer_size: 0,
             key_tex: ptr::null_mut(),
+            matte_plate_tex: ptr::null_mut(),
+            frame_counter: 0,
+            stage_frame: [0; 2],
+            delay_ring: Vec::new(),
+            delay_next: 0,
             readback: Vec::new(),
             dumped: false,
         });
@@ -637,10 +910,34 @@ unsafe extern "C" fn get_defaults(settings: *mut obs_data_t) {
         obs_data_set_default_double(settings, S_SIMILARITY.as_ptr(), d.similarity as f64);
         obs_data_set_default_double(settings, S_SMOOTHNESS.as_ptr(), d.smoothness as f64);
         obs_data_set_default_double(settings, S_DESPILL.as_ptr(), d.despill as f64);
+        obs_data_set_default_string(settings, S_DESPILL_MODE.as_ptr(), c"legacy".as_ptr());
         obs_data_set_default_double(settings, S_FG_DETAIL.as_ptr(), d.fg_detail as f64);
         obs_data_set_default_double(settings, S_MATTE_BLACK.as_ptr(), d.matte_black as f64);
         obs_data_set_default_double(settings, S_MATTE_WHITE.as_ptr(), d.matte_white as f64);
         obs_data_set_default_bool(settings, S_BYPASS.as_ptr(), d.bypass);
+        obs_data_set_default_string(settings, S_CORRECT_MODE.as_ptr(), c"off".as_ptr());
+        obs_data_set_default_double(settings, S_VETO_STRENGTH.as_ptr(), d.veto_strength as f64);
+        obs_data_set_default_double(settings, S_FILL_STRENGTH.as_ptr(), d.fill_strength as f64);
+        obs_data_set_default_double(
+            settings,
+            S_CORRECT_SIMILARITY.as_ptr(),
+            d.correct_similarity as f64,
+        );
+        obs_data_set_default_double(
+            settings,
+            S_CORRECT_SMOOTHNESS.as_ptr(),
+            d.correct_smoothness as f64,
+        );
+        obs_data_set_default_double(settings, S_CHANGE_GATE.as_ptr(), d.change_gate as f64);
+        obs_data_set_default_double(
+            settings,
+            S_CHANGE_THRESHOLD.as_ptr(),
+            d.change_threshold as f64,
+        );
+        obs_data_set_default_double(settings, S_SPATIAL_GATE.as_ptr(), d.spatial_gate as f64);
+        obs_data_set_default_int(settings, S_CORRECT_REACH.as_ptr(), d.correct_reach as i64);
+        obs_data_set_default_bool(settings, S_SYNC_DELAY.as_ptr(), d.sync_delay);
+        obs_data_set_default_int(settings, S_DELAY_BUFFER.as_ptr(), d.delay_buffer as i64);
         obs_data_set_default_int(settings, S_DEVICE.as_ptr(), d.device_id as i64);
         obs_data_set_default_int(settings, S_QUALITY.as_ptr(), d.infer_size as i64);
         obs_data_set_default_string(settings, S_MODELS_DIR.as_ptr(), c"".as_ptr());
@@ -734,6 +1031,29 @@ unsafe extern "C" fn get_properties(data: *mut c_void) -> *mut obs_properties_t 
             c"Removes screen color bounced onto the subject, preserving luminance.".as_ptr(),
         );
 
+        let despill_mode = obs_properties_add_list(
+            props,
+            S_DESPILL_MODE.as_ptr(),
+            c"Despill mode".as_ptr(),
+            OBS_COMBO_TYPE_LIST,
+            OBS_COMBO_FORMAT_STRING,
+        );
+        obs_property_list_add_string(despill_mode, c"Legacy (redistribute)".as_ptr(), c"legacy".as_ptr());
+        obs_property_list_add_string(despill_mode, c"Plate only".as_ptr(), c"plate".as_ptr());
+        obs_property_list_add_string(despill_mode, c"Clamp (no magenta)".as_ptr(), c"clamp".as_ptr());
+        obs_property_list_add_string(
+            despill_mode, c"Plate + clamp".as_ptr(), c"plate_clamp".as_ptr());
+        obs_property_set_long_description(
+            despill_mode,
+            c"Legacy despills the final mix and hands the removed screen energy to the other \
+              two channels, which can turn spill into a purple/magenta fringe on dark \
+              backgrounds - and it re-despills the model's already-unmixed foreground. Plate \
+              modes despill only the camera plate's contribution and leave the model color \
+              alone; Clamp modes cap the screen channel without boosting the others, so edges \
+              go neutral instead of magenta. Plate + clamp is both changes."
+                .as_ptr(),
+        );
+
         let detail = obs_properties_add_float_slider(
             props,
             S_FG_DETAIL.as_ptr(),
@@ -766,6 +1086,80 @@ unsafe extern "C" fn get_properties(data: *mut c_void) -> *mut obs_properties_t 
             1.0,
             0.005,
         );
+
+        let correct = obs_properties_add_list(
+            props,
+            S_CORRECT_MODE.as_ptr(),
+            c"Lag correction (experimental)".as_ptr(),
+            OBS_COMBO_TYPE_LIST,
+            OBS_COMBO_FORMAT_STRING,
+        );
+        obs_property_list_add_string(correct, c"Off".as_ptr(), c"off".as_ptr());
+        obs_property_list_add_string(correct, c"Veto false white (ghosts)".as_ptr(), c"veto".as_ptr());
+        obs_property_list_add_string(correct, c"Fill false black (holes)".as_ptr(), c"fill".as_ptr());
+        obs_property_list_add_string(correct, c"Veto + fill".as_ptr(), c"both".as_ptr());
+        obs_property_set_long_description(
+            correct,
+            c"Same-frame GPU chroma correction of the lagging neural matte. Veto removes matte \
+              left opaque over pixels that are now plainly screen (trailing ghosts); fill raises \
+              matte over pixels that are now plainly subject (leading-edge holes). Ambiguous \
+              pixels (hair, blur, spill) are left to the network. Experimental: tune with the \
+              sliders below, which only apply while this is not Off."
+                .as_ptr(),
+        );
+
+        obs_properties_add_float_slider(
+            props, S_VETO_STRENGTH.as_ptr(), c"Correction: veto strength".as_ptr(), 0.0, 1.0, 0.01);
+        obs_properties_add_float_slider(
+            props, S_FILL_STRENGTH.as_ptr(), c"Correction: fill strength".as_ptr(), 0.0, 1.0, 0.01);
+        let csim = obs_properties_add_float_slider(
+            props, S_CORRECT_SIMILARITY.as_ptr(), c"Correction: similarity".as_ptr(), 0.0, 1.0, 0.01);
+        obs_property_set_long_description(
+            csim,
+            c"Chroma distance below which a pixel counts as definitely screen for correction. \
+              Separate from the Hint similarity so the two can be tuned independently. Lower is \
+              more conservative (only the purest screen pixels trigger a veto)."
+                .as_ptr(),
+        );
+        obs_properties_add_float_slider(
+            props, S_CORRECT_SMOOTHNESS.as_ptr(), c"Correction: smoothness".as_ptr(), 0.0, 0.5, 0.005);
+        let cgate = obs_properties_add_float_slider(
+            props, S_CHANGE_GATE.as_ptr(), c"Correction: change gate".as_ptr(), 0.0, 1.0, 0.01);
+        obs_property_set_long_description(
+            cgate,
+            c"At 1, only pixels that changed since the matte was computed can be corrected - a \
+              pixel identical to what the network saw cannot have a stale matte, which protects \
+              green clothing and static set pieces. At 0 the chroma evidence applies everywhere."
+                .as_ptr(),
+        );
+        obs_properties_add_float_slider(
+            props, S_CHANGE_THRESHOLD.as_ptr(), c"Correction: change threshold".as_ptr(), 0.0, 0.5, 0.005);
+        let sgate = obs_properties_add_float_slider(
+            props, S_SPATIAL_GATE.as_ptr(), c"Correction: spatial gate".as_ptr(), 0.0, 1.0, 0.01);
+        obs_property_set_long_description(
+            sgate,
+            c"At 1, veto needs background-level matte within reach and fill needs solid matte \
+              within reach, so corrections stay near matte edges (and enclosed holes) instead of \
+              punching into the subject interior or raising background objects."
+                .as_ptr(),
+        );
+        obs_properties_add_int(
+            props, S_CORRECT_REACH.as_ptr(), c"Correction: reach (matte px)".as_ptr(), 0, 64, 1);
+
+        let sync = obs_properties_add_bool(
+            props, S_SYNC_DELAY.as_ptr(), c"Sync delay: delay video to match matte".as_ptr());
+        obs_property_set_long_description(
+            sync,
+            c"Delay the picture so it is composited with the exact frame each matte was \
+              computed from: no matte misregistration at any inference speed, so fast hands \
+              stop ghosting. Costs: this source runs behind real time by roughly the \
+              inference latency (compensate your microphone with OBS sync offset), the \
+              picture advances in step with matte updates rather than perfectly smoothly, \
+              and the ring buffer below costs one full frame of VRAM per buffered frame."
+                .as_ptr(),
+        );
+        obs_properties_add_int(
+            props, S_DELAY_BUFFER.as_ptr(), c"Sync delay: buffer frames".as_ptr(), 4, 120, 1);
 
         obs_properties_add_bool(props, S_BYPASS.as_ptr(), c"Bypass (show original)".as_ptr());
 

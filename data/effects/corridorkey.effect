@@ -11,17 +11,35 @@ uniform float4x4 ViewProj;
 
 uniform texture2d image;    // full-resolution plate, sRGB-encoded UNORM
 uniform texture2d key_tex;  // 512x512: rgb = straight foreground (sRGB), a = alpha
+uniform texture2d matte_plate_tex; // 512x512 plate the current matte was computed from
 
 // Downscale
 uniform float2 tap_step;    // texel offset between box-filter taps
 
 // Composite
 uniform float despill_strength;
+uniform int despill_mode;  // 0 = legacy, 1 = plate, 2 = clamp, 3 = plate+clamp
 uniform int screen_channel; // 1 = green screen, 2 = blue screen
 uniform float fg_detail;    // 0 = model foreground everywhere, 1 = full-res plate where opaque
 uniform float matte_black;  // alpha values at/below this clamp to 0
 uniform float matte_white;  // alpha values at/above this clamp to 1
 uniform float bypass;       // 1 = pass the plate through untouched
+
+// Same-frame matte correction (mirrors src/composite.rs::correct_alpha)
+uniform int correct_mode;   // 0 = off, 1 = veto, 2 = fill, 3 = both
+uniform float veto_strength;
+uniform float fill_strength;
+uniform float2 key_uv;      // reference screen chroma (U, V), BT.709
+uniform float correct_similarity;
+uniform float correct_smoothness;
+uniform float change_gate;  // 0 = ignore change, 1 = only correct changed pixels
+uniform float change_threshold;
+uniform float spatial_gate; // 0 = correct anywhere, 1 = matte-context gated
+uniform float2 reach_offset; // matte-neighborhood tap offset in UV
+
+// Sync delay: the retained plate frame this matte belongs to.
+uniform texture2d delayed_tex;
+uniform float use_delayed;  // 1 = composite delayed_tex instead of image
 
 sampler_state linearClamp {
 	Filter    = Linear;
@@ -62,7 +80,8 @@ float4 PSDownscale(VertData v_in) : TARGET
 
 // Luminance-preserving despill, matching CorridorKeyModule/core/color_utils.py:
 // subtract the screen channel's excess over the other two, then give half of
-// the removed energy back to each.
+// the removed energy back to each. Note the give-back turns removed green into
+// a red+blue (magenta) boost; see despill_as for the alternatives.
 float3 despill(float3 c, int channel, float strength)
 {
 	float s, a, b;
@@ -80,9 +99,99 @@ float3 despill(float3 c, int channel, float strength)
 	return float3(a, s, b);
 }
 
+// Clamp-style despill, mirroring src/composite.rs::despill_clamp: pull the
+// screen channel toward the mean of the other two without boosting them, so
+// spill removal makes the pixel neutral/darker instead of magenta.
+float3 despill_clamp(float3 c, int channel, float strength)
+{
+	float3 out_c = c;
+	if (channel == 2)
+		out_c.b = c.b - max(c.b - (c.r + c.g) * 0.5, 0.0) * strength;
+	else
+		out_c.g = c.g - max(c.g - (c.r + c.b) * 0.5, 0.0) * strength;
+	return out_c;
+}
+
+// Mirrors src/composite.rs::despill_as. Modes 2/3 clamp; 0/1 redistribute.
+float3 despill_as(float3 c)
+{
+	if (despill_mode == 2 || despill_mode == 3)
+		return despill_clamp(c, screen_channel, despill_strength);
+	return despill(c, screen_channel, despill_strength);
+}
+
+// Brightness-normalized BT.709 chroma, matching src/hint.rs::rgb_to_uv.
+float2 rgb_to_uv(float3 c)
+{
+	float m = max(c.r, max(c.g, c.b));
+	m = max(m, 1e-6);
+	c /= m;
+	float y = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+	return float2((c.b - y) / 1.8556, (c.r - y) / 1.5748);
+}
+
+// Returns (definite-screen confidence, definite-not-screen confidence) with a
+// silent dead zone between, mirroring src/composite.rs::chroma_evidence.
+float2 chroma_evidence(float3 plate)
+{
+	if (max(plate.r, max(plate.g, plate.b)) < 0.0196) // 5/255, no usable hue
+		return float2(0.0, 0.0);
+	float2 d = rgb_to_uv(plate) - key_uv;
+	float dist = sqrt(dot(d, d));
+	float lo = correct_similarity;
+	float hi = correct_similarity + max(correct_smoothness, 1e-4);
+	float g = smoothstep(lo, hi, dist);
+	return float2(1.0 - smoothstep(0.15, 0.45, g), smoothstep(0.55, 0.85, g));
+}
+
+// Mirrors src/composite.rs::correct_alpha. `matte_min/max` are shaped alpha
+// bounds over the reach neighborhood; `matte_plate` is what the model saw.
+float correct_alpha(float alpha, float3 plate, float3 matte_plate,
+                    float matte_min, float matte_max)
+{
+	float2 ev = chroma_evidence(plate);
+	if (ev.x <= 0.0 && ev.y <= 0.0)
+		return alpha;
+
+	float3 dplate = abs(plate - matte_plate);
+	float diff = max(dplate.r, max(dplate.g, dplate.b));
+	float t = max(change_threshold, 1e-4);
+	float changed = smoothstep(t, t * 2.0 + 0.02, diff);
+	float gate = 1.0 - saturate(change_gate) * (1.0 - changed);
+	if (gate <= 0.0)
+		return alpha;
+
+	float sg = saturate(spatial_gate);
+	float fill_ctx = 1.0 - sg * (1.0 - smoothstep(0.5, 0.9, matte_max));
+	float veto_ctx = 1.0 - sg * smoothstep(0.1, 0.5, matte_min);
+
+	float a = alpha;
+	if (correct_mode == 1 || correct_mode == 3) {
+		float w = saturate(veto_strength * ev.x * gate * veto_ctx);
+		a *= 1.0 - w;
+	}
+	if (correct_mode == 2 || correct_mode == 3) {
+		float w = saturate(fill_strength * ev.y * gate * fill_ctx);
+		a += (1.0 - a) * w;
+	}
+	return saturate(a);
+}
+
+// Passthrough used by the sync-delay ring capture: full-res copy of the
+// filter input into a retained render target.
+float4 PSCapture(VertData v_in) : TARGET
+{
+	return image.Sample(linearClamp, v_in.uv);
+}
+
 float4 PSComposite(VertData v_in) : TARGET
 {
-	float4 plate = image.Sample(linearClamp, v_in.uv);
+	// Sync delay swaps the live plate for the retained frame the current
+	// matte was computed from; everything downstream (correction change gate
+	// included) then operates on a temporally aligned pair.
+	float4 plate = (use_delayed > 0.5)
+		? delayed_tex.Sample(linearClamp, v_in.uv)
+		: image.Sample(linearClamp, v_in.uv);
 	float4 key   = key_tex.Sample(linearClamp, v_in.uv);
 
 	// Matte black/white point, the usual compositor controls for tightening a
@@ -90,14 +199,41 @@ float4 PSComposite(VertData v_in) : TARGET
 	float span  = max(matte_white - matte_black, 1e-4);
 	float alpha = saturate((key.a - matte_black) / span);
 
+	// Same-frame correction of the (possibly stale) neural matte. Shaping is
+	// monotonic, so shaping the raw neighborhood bounds gives shaped bounds.
+	if (correct_mode != 0) {
+		float raw_min = key.a;
+		float raw_max = key.a;
+		float na;
+		na = key_tex.Sample(linearClamp, v_in.uv + float2( reach_offset.x, 0.0)).a;
+		raw_min = min(raw_min, na); raw_max = max(raw_max, na);
+		na = key_tex.Sample(linearClamp, v_in.uv + float2(-reach_offset.x, 0.0)).a;
+		raw_min = min(raw_min, na); raw_max = max(raw_max, na);
+		na = key_tex.Sample(linearClamp, v_in.uv + float2(0.0,  reach_offset.y)).a;
+		raw_min = min(raw_min, na); raw_max = max(raw_max, na);
+		na = key_tex.Sample(linearClamp, v_in.uv + float2(0.0, -reach_offset.y)).a;
+		raw_min = min(raw_min, na); raw_max = max(raw_max, na);
+		float matte_min = saturate((raw_min - matte_black) / span);
+		float matte_max = saturate((raw_max - matte_black) / span);
+		float3 matte_plate = matte_plate_tex.Sample(linearClamp, v_in.uv).rgb;
+		alpha = correct_alpha(alpha, plate.rgb, matte_plate, matte_min, matte_max);
+	}
+
+	// Plate-only modes (1, 3) despill the plate contribution before the mix,
+	// so the model's already-unmixed color is never despilled a second time.
+	float3 plate_rgb = plate.rgb;
+	if (despill_mode == 1 || despill_mode == 3)
+		plate_rgb = despill_as(plate_rgb);
+
 	// In the solid interior the 512px prediction carries no detail the plate
 	// doesn't already have, so cross-fade back to the plate there and keep the
 	// model's unmixed color for the semi-transparent edges, which is the whole
 	// reason for running it.
 	float w = fg_detail * smoothstep(0.85, 1.0, alpha);
-	float3 fg = lerp(key.rgb, plate.rgb, w);
+	float3 fg = lerp(key.rgb, plate_rgb, w);
 
-	fg = despill(fg, screen_channel, despill_strength);
+	if (despill_mode == 0 || despill_mode == 2)
+		fg = despill_as(fg);
 
 	float4 keyed = float4(fg, alpha * plate.a);
 	return lerp(keyed, plate, bypass);
@@ -118,5 +254,14 @@ technique Draw
 	{
 		vertex_shader = VSDefault(v_in);
 		pixel_shader  = PSComposite(v_in);
+	}
+}
+
+technique Capture
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSCapture(v_in);
 	}
 }

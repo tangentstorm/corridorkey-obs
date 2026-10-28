@@ -38,13 +38,24 @@ struct Job {
     bgra: Vec<u8>,
     stride: usize,
     params: HintParams,
+    /// Render-thread frame counter value when this frame was captured. Echoed
+    /// back in the result so the sync-delay ring buffer can pair the matte
+    /// with the exact plate frame it belongs to.
+    frame_id: u64,
 }
 
 /// Model output, packed as one RGBA8 image so the render thread does a single
 /// texture upload: RGB = straight (un-premultiplied) foreground in sRGB,
 /// A = linear alpha.
+///
+/// `plate` is the (downscaled) input frame this result was computed from, also
+/// RGBA8. The composite shader diffs it against the live plate for the
+/// correction change gate: pixels that still match cannot have a stale matte.
 pub struct KeyResult {
     pub rgba: Vec<u8>,
+    pub plate: Vec<u8>,
+    /// Frame counter of the plate this matte was computed from (see Job).
+    pub frame_id: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -135,8 +146,14 @@ impl Engine {
 
     /// Hands a frame to the worker. Returns false if it was dropped because the
     /// worker is still busy, which is the normal steady state.
-    pub fn submit(&self, bgra: Vec<u8>, stride: usize, params: HintParams) -> bool {
-        match self.tx.try_send(Job { bgra, stride, params }) {
+    pub fn submit(
+        &self,
+        bgra: Vec<u8>,
+        stride: usize,
+        params: HintParams,
+        frame_id: u64,
+    ) -> bool {
+        match self.tx.try_send(Job { bgra, stride, params, frame_id }) {
             Ok(()) => {
                 self.busy.store(true, Ordering::Release);
                 true
@@ -243,7 +260,8 @@ fn worker_main(
         let started = std::time::Instant::now();
 
         match key_bgra(&mut session, &job.bgra, job.stride, &job.params, &mut scratch) {
-            Ok((result, t)) => {
+            Ok((mut result, t)) => {
+                result.frame_id = job.frame_id;
                 last_us.store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                 last_timings.lock().replace(t);
                 *latest.lock() = Some(Arc::new(result));
@@ -312,7 +330,25 @@ pub fn key_bgra(
     chroma_hint(bgra, size, size, stride, params, &mut scratch.hint);
     t.preprocess_us = start.elapsed().as_micros() as u64;
 
-    let result = run(session, size, &scratch.rgb, &scratch.hint, &mut t)?;
+    let mut result = run(session, size, &scratch.rgb, &scratch.hint, &mut t)?;
+
+    // Pack the input plate alongside the result (BGRA -> RGBA), so the shader
+    // can tell which pixels have changed since this matte was computed.
+    let pack_start = std::time::Instant::now();
+    let mut plate = vec![0u8; size * size * 4];
+    for y in 0..size {
+        let row = &bgra[y * stride..y * stride + size * 4];
+        let out = &mut plate[y * size * 4..(y + 1) * size * 4];
+        for x in 0..size {
+            out[x * 4] = row[x * 4 + 2];
+            out[x * 4 + 1] = row[x * 4 + 1];
+            out[x * 4 + 2] = row[x * 4];
+            out[x * 4 + 3] = 255;
+        }
+    }
+    result.plate = plate;
+    t.pack_us += pack_start.elapsed().as_micros() as u64;
+
     Ok((result, t))
 }
 
@@ -469,7 +505,7 @@ fn run(
         rgba[i * 4 + 3] = to_u8(alpha[i]);
     }
     t.pack_us = pack_start.elapsed().as_micros() as u64;
-    Ok(KeyResult { rgba })
+    Ok(KeyResult { rgba, plate: Vec::new(), frame_id: 0 })
 }
 
 #[inline]
